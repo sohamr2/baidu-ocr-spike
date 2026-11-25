@@ -285,21 +285,56 @@ def estimate_input_tokens(
 # Generate capture (true stop reason / token totals)
 # --------------------------------------------------------------------------- #
 @dataclass
-class GenerateSummary:
-    """Best-effort summary of captured ``generate`` calls.
+class CallRecord:
+    """One captured (outermost) ``generate`` call."""
 
-    ``input_tokens`` is the measured input length (text + expanded image tokens)
-    taken from the ids/embeds passed to ``generate`` on the call that fired.
+    target: Optional[str]
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    stop_reason: str  # "eos" | "length" | "unknown"
+
+
+@dataclass
+class GenerateSummary:
+    """Every outermost ``generate`` call captured during one inference.
+
     ``fired`` is False when no patched ``generate`` was invoked, in which case
-    callers must fall back to the token-count estimate (and should warn).
+    callers fall back to the token-count estimate (and should warn). Derived
+    quantities are exposed as properties so result rows stay simple.
     """
 
-    generate_calls: int
-    last_total_tokens: Optional[int]
-    input_tokens: Optional[int]
-    ended_with_eos: Optional[bool]
+    calls: list[CallRecord]
     fired: bool
-    target: Optional[str]
+
+    @property
+    def generate_calls(self) -> int:
+        return len(self.calls)
+
+    @property
+    def output_tokens_total(self) -> Optional[int]:
+        if not self.calls:
+            return None
+        return sum(c.output_tokens or 0 for c in self.calls)
+
+    @property
+    def input_tokens_first(self) -> Optional[int]:
+        return self.calls[0].input_tokens if self.calls else None
+
+    @property
+    def any_hit_max_length(self) -> Optional[bool]:
+        if not self.calls:
+            return None
+        return any(c.stop_reason == "length" for c in self.calls)
+
+    @property
+    def overall_stop_reason(self) -> Optional[str]:
+        if not self.calls:
+            return None
+        return "length" if self.any_hit_max_length else "eos"
+
+    @property
+    def first_target(self) -> Optional[str]:
+        return self.calls[0].target if self.calls else None
 
 
 def _infer_input_len(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[int]:
@@ -328,29 +363,49 @@ def _infer_input_len(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[
         return None
 
 
+def _seq_total_and_eos(out: Any, eos_token_id: Optional[int]) -> tuple[Optional[int], Optional[bool]]:
+    """Return ``(total_tokens, ended_with_eos)`` for a ``generate`` return value."""
+    seq = getattr(out, "sequences", None)
+    if seq is None and isinstance(out, torch.Tensor):
+        seq = out
+    if seq is None:
+        return None, None
+    try:
+        row = seq[0] if seq.ndim >= 2 else seq
+        total = int(row.shape[-1])
+        last_token = int(row[-1])
+    except (IndexError, RuntimeError, ValueError):
+        return None, None
+    ended = None if eos_token_id is None else (last_token == eos_token_id)
+    return total, ended
+
+
 class GenerateCapture:
     """Transiently wrap ``generate`` on the model and every submodule that owns it.
 
     The remote ``infer``/``infer_multi`` code may call ``self.generate(...)`` or
-    an inner module's ``generate`` (e.g. a language-model submodule). Rather than
-    silently falling back to approximation, we patch the model plus every
-    submodule exposing a callable ``generate`` and record which one fired, its
-    returned ids (true total length, EOS vs length stop), and the measured input
-    length. ``fired`` reports whether any wrapper was actually invoked.
+    an inner module's ``generate`` (e.g. a language-model submodule), and may call
+    it once or once per page. We patch the model plus every submodule exposing a
+    callable ``generate`` and record **every outermost** call — a depth counter
+    skips nested patched calls so an outer ``generate`` that delegates to an inner
+    ``generate`` is counted once. ``fired`` reports whether any wrapper ran.
     """
 
     def __init__(self, model: Any) -> None:
         self._model = model
         self._patched: list[tuple[Any, Callable[..., Any]]] = []
+        self._depth = 0
         self.records: list[dict[str, Any]] = []
 
     def _targets(self) -> list[tuple[str, Any]]:
         targets: list[tuple[str, Any]] = [("<model>", self._model)]
-        for name, module in self._model.named_modules():
-            if module is self._model:
-                continue
-            if callable(getattr(module, "generate", None)):
-                targets.append((name, module))
+        named = getattr(self._model, "named_modules", None)
+        if callable(named):
+            for name, module in named():
+                if module is self._model:
+                    continue
+                if callable(getattr(module, "generate", None)):
+                    targets.append((name, module))
         return targets
 
     def __enter__(self) -> "GenerateCapture":
@@ -361,11 +416,17 @@ class GenerateCapture:
 
             def make_wrapper(orig: Callable[..., Any], target: str) -> Callable[..., Any]:
                 def wrapper(*args: Any, **kwargs: Any) -> Any:
-                    out = orig(*args, **kwargs)
-                    self.records.append(
-                        {"target": target, "out": out,
-                         "input_len": _infer_input_len(args, kwargs)}
-                    )
+                    outermost = self._depth == 0
+                    input_len = _infer_input_len(args, kwargs) if outermost else None
+                    self._depth += 1
+                    try:
+                        out = orig(*args, **kwargs)
+                    finally:
+                        self._depth -= 1
+                    if outermost and self._depth == 0:
+                        self.records.append(
+                            {"target": target, "input_len": input_len, "out": out}
+                        )
                     return out
 
                 return wrapper
@@ -384,34 +445,77 @@ class GenerateCapture:
             except (AttributeError, TypeError):
                 pass
         self._patched.clear()
+        self._depth = 0
 
     def summarize(self, eos_token_id: Optional[int]) -> GenerateSummary:
-        """Summarize captured calls (uses the last call for totals/stop reason)."""
-        if not self.records:
-            return GenerateSummary(0, None, None, None, False, None)
-        last = self.records[-1]
-        out = last["out"]
-        seq = getattr(out, "sequences", None)
-        if seq is None and isinstance(out, torch.Tensor):
-            seq = out
-        total: Optional[int] = None
-        ended: Optional[bool] = None
-        if seq is not None:
-            try:
-                row = seq[0] if seq.ndim >= 2 else seq
-                total = int(row.shape[-1])
-                last_token = int(row[-1])
-                ended = None if eos_token_id is None else (last_token == eos_token_id)
-            except (IndexError, RuntimeError, ValueError):
-                total = None
-        return GenerateSummary(
-            generate_calls=len(self.records),
-            last_total_tokens=total,
-            input_tokens=last.get("input_len"),
-            ended_with_eos=ended,
-            fired=True,
-            target=last.get("target"),
-        )
+        """Convert every recorded outermost call into a :class:`CallRecord`."""
+        calls: list[CallRecord] = []
+        for rec in self.records:
+            total, ended = _seq_total_and_eos(rec["out"], eos_token_id)
+            input_tokens = rec.get("input_len")
+            if total is None:
+                output_tokens = None
+            elif input_tokens is not None and total >= input_tokens:
+                output_tokens = total - input_tokens
+            else:
+                output_tokens = total
+            stop_reason = "eos" if ended is True else "length" if ended is False else "unknown"
+            calls.append(CallRecord(rec.get("target"), input_tokens, output_tokens, stop_reason))
+        return GenerateSummary(calls=calls, fired=bool(self.records))
+
+
+def derive_capture_fields(
+    summary: GenerateSummary,
+    *,
+    n_pages: Optional[int],
+    prompt_tokens: Optional[int],
+) -> dict[str, Any]:
+    """Flatten a :class:`GenerateSummary` into result-row fields."""
+    fields: dict[str, Any] = {
+        "capture_fired": summary.fired,
+        "capture_target": summary.first_target if summary.fired else None,
+        "generate_calls": summary.generate_calls if summary.fired else None,
+        "output_tokens_total": summary.output_tokens_total if summary.fired else None,
+        "input_tokens_first": summary.input_tokens_first if summary.fired else None,
+        "any_hit_max_length": summary.any_hit_max_length if summary.fired else None,
+        "per_page_generation": None,
+        "image_tokens_per_page_measured": None,
+    }
+    if not summary.fired:
+        return fields
+    if n_pages:
+        fields["per_page_generation"] = summary.generate_calls == n_pages
+    fields["image_tokens_per_page_measured"] = _measure_image_tokens(
+        summary, prompt_tokens=prompt_tokens, n_pages=n_pages
+    )
+    return fields
+
+
+def _measure_image_tokens(
+    summary: GenerateSummary,
+    *,
+    prompt_tokens: Optional[int],
+    n_pages: Optional[int],
+) -> Optional[float]:
+    """Measured image tokens per page from the captured input lengths.
+
+    One call: ``(input - prompt) / pages``. Per-page calls
+    (``generate_calls == n_pages``): the mean of ``(input - prompt)`` across
+    calls. Otherwise None (can't cleanly attribute).
+    """
+    if prompt_tokens is None:
+        return None
+    inputs = [c.input_tokens for c in summary.calls if c.input_tokens is not None]
+    if not inputs:
+        return None
+    if summary.generate_calls == 1:
+        if not n_pages:
+            return None
+        return round((inputs[0] - prompt_tokens) / n_pages, 1)
+    if n_pages and summary.generate_calls == n_pages:
+        values = [value - prompt_tokens for value in inputs]
+        return round(sum(values) / len(values), 1)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -480,12 +584,7 @@ class InferenceOutcome:
     output_files: dict[str, str]
     raw_path: str
     cleaned_path: str
-    generate_calls: int = 0
-    captured_total_tokens: Optional[int] = None
-    captured_input_tokens: Optional[int] = None
-    captured_ended_eos: Optional[bool] = None
-    capture_fired: bool = False
-    capture_target: Optional[str] = None
+    capture_summary: Optional[GenerateSummary] = None
 
 
 def _run_timed(call: Callable[[], Any]) -> tuple[Any, float, float, float]:
@@ -566,7 +665,7 @@ def run_inference(
     summary = (
         capture.summarize(getattr(tokenizer, "eos_token_id", None))
         if capture is not None
-        else GenerateSummary(0, None, None, None, False, None)
+        else GenerateSummary(calls=[], fired=False)
     )
     if capture is not None and not summary.fired:
         logger.warning(
@@ -594,12 +693,7 @@ def run_inference(
         output_files=output_files,
         raw_path=str(raw_path),
         cleaned_path=str(cleaned_path),
-        generate_calls=summary.generate_calls,
-        captured_total_tokens=summary.last_total_tokens,
-        captured_input_tokens=summary.input_tokens,
-        captured_ended_eos=summary.ended_with_eos,
-        capture_fired=summary.fired,
-        capture_target=summary.target,
+        capture_summary=summary,
     )
 
 
@@ -717,23 +811,6 @@ def _compute_hit_max_length(
     return (input_tokens + output_tokens) >= threshold
 
 
-def _measured_image_tokens(
-    *,
-    captured_input_tokens: Optional[int],
-    prompt_tokens: Optional[int],
-    n_pages: Optional[int],
-) -> Optional[float]:
-    """Measured image tokens per page = (actual input - prompt text) / pages.
-
-    Lets us compare the real per-page image-token cost against the configured
-    ``IMAGE_TOKENS_PER_PAGE`` estimate. Returns None when the capture or inputs
-    needed to compute it are missing.
-    """
-    if captured_input_tokens is None or prompt_tokens is None or not n_pages:
-        return None
-    return round((captured_input_tokens - prompt_tokens) / n_pages, 1)
-
-
 def _stop_reason(hit_max_length: bool, captured_ended_eos: Optional[bool]) -> str:
     """Return the stop reason, preferring the captured EOS signal when present."""
     if captured_ended_eos is not None:
@@ -788,16 +865,18 @@ def execute_run(
         "max_length": max_length,
         "max_length_semantics": max_length_semantics,
         "input_tokens": input_tokens,  # estimate from IMAGE_TOKENS_PER_PAGE
-        "input_tokens_actual": None,  # measured from GenerateCapture
+        "input_tokens_first": None,  # measured (text + image) from GenerateCapture
         "image_tokens_per_page_measured": None,
         "capture_fired": None,
         "capture_target": None,
+        "generate_calls": None,
+        "per_page_generation": None,
+        "any_hit_max_length": None,
+        "output_tokens_total": None,
         "wall_seconds": None,
         "gpu_seconds": None,
         "peak_vram_gb": None,
         "output_tokens": None,
-        "generate_calls": None,
-        "captured_total_tokens": None,
         "hit_max_length": None,
         "stop_reason": None,
         "last_page_covered": None,
@@ -809,41 +888,44 @@ def execute_run(
 
     try:
         outcome = runner()
-        hit_max = _compute_hit_max_length(
-            output_tokens=outcome.output_tokens,
-            input_tokens=input_tokens or 0,
-            captured_total_tokens=outcome.captured_total_tokens,
-            max_length=max_length,
-            semantics=max_length_semantics,
-            slack=max_length_slack,
+        summary = outcome.capture_summary or GenerateSummary(calls=[], fired=False)
+        capture_fields = derive_capture_fields(
+            summary, n_pages=run_key.get("input_pages"), prompt_tokens=prompt_tokens
         )
+
+        # Prefer the captured truth (any call stopped on length) over the
+        # token-count approximation when the capture actually fired.
+        if summary.fired and summary.any_hit_max_length is not None:
+            hit_max = summary.any_hit_max_length
+            stop_reason = summary.overall_stop_reason
+        else:
+            hit_max = _compute_hit_max_length(
+                output_tokens=outcome.output_tokens,
+                input_tokens=input_tokens or 0,
+                captured_total_tokens=None,
+                max_length=max_length,
+                semantics=max_length_semantics,
+                slack=max_length_slack,
+            )
+            stop_reason = _stop_reason(hit_max, None)
+
         covered = last_page_check(outcome) if last_page_check is not None else None
-        measured_img = _measured_image_tokens(
-            captured_input_tokens=outcome.captured_input_tokens,
-            prompt_tokens=prompt_tokens,
-            n_pages=run_key.get("input_pages"),
-        )
+        row.update(capture_fields)
         row.update(
             wall_seconds=round(outcome.wall_seconds, 3),
             gpu_seconds=round(outcome.gpu_seconds, 3),
             peak_vram_gb=round(outcome.peak_vram_gb, 3),
             output_tokens=outcome.output_tokens,
-            generate_calls=outcome.generate_calls,
-            captured_total_tokens=outcome.captured_total_tokens,
-            input_tokens_actual=outcome.captured_input_tokens,
-            image_tokens_per_page_measured=measured_img,
-            capture_fired=outcome.capture_fired,
-            capture_target=outcome.capture_target,
             hit_max_length=bool(hit_max),
-            stop_reason=_stop_reason(hit_max, outcome.captured_ended_eos),
+            stop_reason=stop_reason,
             last_page_covered=covered,
             block_types=outcome.block_types,
             raw_path=outcome.raw_path,
             cleaned_path=outcome.cleaned_path,
         )
-        if not outcome.capture_fired:
+        if not summary.fired:
             logger.warning(
-                "Run %s: GenerateCapture did not fire; input_tokens_actual is "
+                "Run %s: GenerateCapture did not fire; measured input tokens are "
                 "unavailable and hit_max_length/stop_reason are approximate.",
                 run_key,
             )

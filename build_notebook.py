@@ -342,11 +342,12 @@ How this spike uses it:
 
 - `hit_max_length` is computed from the chosen semantics. `GenerateCapture` patches `generate` on
   the model **and every submodule that owns it** (so an inner language-model `generate` is still
-  caught) and records the **true** total token count, the **measured input length** (text +
-  expanded image tokens), and whether generation ended on EOS vs the length cap. Each row logs
-  `capture_fired`, `capture_target`, `input_tokens_actual`, `image_tokens_per_page_measured`
-  (next to the `input_tokens` estimate), `generate_calls`, `captured_total_tokens` and
-  `stop_reason`. If the capture does not fire, a warning is emitted — the fallback is never silent.
+  caught) and records **every outermost** generate call (nested patched calls are de-duplicated
+  via a depth counter), so per-page generation shows up as multiple calls. Each row logs
+  `capture_fired`, `capture_target`, `generate_calls`, `per_page_generation`, `input_tokens_first`
+  and `image_tokens_per_page_measured` (next to the `input_tokens` estimate), plus
+  `output_tokens_total`, `any_hit_max_length` and `stop_reason`. If the capture does not fire, a
+  warning is emitted — the fallback is never silent.
 - A 300-page book is ~150k+ output tokens, far beyond 32,768 — so at the default cap, "whole book
   in one pass" is expected to truncate. Experiment B measures this directly and then raises the
   cap (`MAX_LENGTH_ESCALATION`) until it stops truncating or OOMs.

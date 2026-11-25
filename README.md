@@ -92,10 +92,12 @@ or **`max_new_tokens`** (output only); set `MAX_LENGTH_SEMANTICS` accordingly. E
 input tokens, output tokens, `hit_max_length`, and a `stop_reason`. The true total token count,
 EOS-vs-length stop reason, and the **measured** input length are captured directly: `GenerateCapture`
 patches `generate` on the model *and every submodule that owns it*, so an inner language-model
-`generate` is still caught. Each row logs `capture_fired`, `input_tokens_actual`, and
-`image_tokens_per_page_measured` next to the `IMAGE_TOKENS_PER_PAGE` estimate — so image-token cost
-is measured, not assumed. If the capture does not fire, a warning is emitted (never a silent
-fallback).
+`generate` is still caught, and **every outermost** call is recorded (nested calls de-duplicated via
+a depth counter), so per-page generation shows up as multiple calls. Each row logs `capture_fired`,
+`generate_calls`, `per_page_generation`, `input_tokens_first`, `output_tokens_total`,
+`any_hit_max_length`, and `image_tokens_per_page_measured` next to the `IMAGE_TOKENS_PER_PAGE`
+estimate — so image-token cost is measured, not assumed. If the capture does not fire, a warning is
+emitted (never a silent fallback).
 
 ## Metrics
 
