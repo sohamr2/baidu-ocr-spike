@@ -134,7 +134,10 @@ def detect_runtime() -> RuntimeInfo:
 
     index = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(index)
-    bf16 = torch.cuda.is_bf16_supported()
+    # torch.cuda.is_bf16_supported() over-reports on pre-Ampere GPUs (e.g. T4, sm_75),
+    # where bf16 is only emulated -- that ruins the timing/VRAM numbers this spike measures.
+    # Require NATIVE bf16: compute capability >= 8.0 (Ampere+) AND torch agreeing.
+    bf16 = props.major >= 8 and torch.cuda.is_bf16_supported()
     if bf16:
         dtype, dtype_str = torch.bfloat16, "bfloat16"
     else:
