@@ -1,0 +1,31 @@
+# Phase 0 spike dependencies for baidu/Unlimited-OCR.
+# Versions below "model card" are the exact ones the model card lists as tested
+# (Python 3.12, CUDA 12.9). Install these on a Colab GPU runtime. If Colab's
+# preinstalled torch differs, the notebook's install cell handles the conflict
+# and tells you when to restart the runtime.
+
+# --- model card tested versions -------------------------------------------
+torch==2.10.0
+torchvision==0.25.0
+transformers==4.57.1
+Pillow==12.1.1
+einops==0.8.2
+addict==2.4.0
+easydict==1.13
+pymupdf==1.27.2.2
+psutil==7.2.2
+matplotlib==3.10.8
+
+# --- added for the spike (metrics / analysis) ------------------------------
+jiwer==3.0.4
+edlib==1.3.9
+rapidfuzz==3.10.1
+pandas==2.2.3
+
+# --- transitive but worth pinning for reproducible model download ----------
+huggingface-hub==0.35.3
+safetensors==0.4.5
+accelerate==1.1.1
+
+# --- tests (CPU-only; metrics.py + marker parser) --------------------------
+pytest==8.3.3
