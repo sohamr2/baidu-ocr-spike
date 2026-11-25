@@ -107,17 +107,31 @@ def test_per_page_generation_counts_each_call() -> None:
     assert fields["image_tokens_per_page_measured"] == 8.0
 
 
-def test_any_hit_max_length_when_one_call_stops_on_length() -> None:
-    # third call ends on a non-EOS token => stopped on length
+def test_any_hit_max_length_when_one_call_reaches_the_cap() -> None:
+    # Each call: input 12 + 5 new = 17 total. With max_length=17 (total semantics)
+    # the third call (non-EOS) reaches the cap => "length"; the EOS calls => "eos".
     model = _Scripted([(5, EOS), (5, EOS), (5, 0)])
     with infer.GenerateCapture(model) as cap:
         model.infer_multi(image_files=[0, 1, 2], input_len=12)
-    summary = cap.summarize(EOS)
+    summary = cap.summarize(EOS, max_length=17, semantics=infer.SEMANTICS_TOTAL, slack=0)
 
     assert summary.generate_calls == 3
     assert summary.any_hit_max_length is True
     assert summary.overall_stop_reason == "length"
     assert [c.stop_reason for c in summary.calls] == ["eos", "eos", "length"]
+
+
+def test_stop_reason_other_when_not_eos_and_under_limit() -> None:
+    # Ends on a non-EOS token but well under the cap => "other" (not "length").
+    model = _Scripted([(5, 0)])
+    with infer.GenerateCapture(model) as cap:
+        model.generate(input_ids=_seq(12, 0))
+    summary = cap.summarize(EOS, max_length=1000, semantics=infer.SEMANTICS_TOTAL, slack=0)
+
+    assert summary.generate_calls == 1
+    assert summary.calls[0].stop_reason == "other"
+    assert summary.any_hit_max_length is False
+    assert summary.overall_stop_reason == "other"
 
 
 # --------------------------------------------------------------------------- #

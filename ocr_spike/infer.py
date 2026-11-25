@@ -330,7 +330,11 @@ class GenerateSummary:
     def overall_stop_reason(self) -> Optional[str]:
         if not self.calls:
             return None
-        return "length" if self.any_hit_max_length else "eos"
+        if self.any_hit_max_length:
+            return "length"
+        if any(c.stop_reason == "eos" for c in self.calls):
+            return "eos"
+        return "other"
 
     @property
     def first_target(self) -> Optional[str]:
@@ -378,6 +382,22 @@ def _seq_total_and_eos(out: Any, eos_token_id: Optional[int]) -> tuple[Optional[
         return None, None
     ended = None if eos_token_id is None else (last_token == eos_token_id)
     return total, ended
+
+
+def _limit_reached(
+    total: Optional[int],
+    output_tokens: Optional[int],
+    max_length: Optional[int],
+    semantics: str,
+    slack: int,
+) -> bool:
+    """Whether a call's token count reached the effective cap (per semantics)."""
+    if max_length is None:
+        return False
+    threshold = max_length - slack
+    if semantics == SEMANTICS_NEW:
+        return output_tokens is not None and output_tokens >= threshold
+    return total is not None and total >= threshold
 
 
 class GenerateCapture:
@@ -447,8 +467,20 @@ class GenerateCapture:
         self._patched.clear()
         self._depth = 0
 
-    def summarize(self, eos_token_id: Optional[int]) -> GenerateSummary:
-        """Convert every recorded outermost call into a :class:`CallRecord`."""
+    def summarize(
+        self,
+        eos_token_id: Optional[int],
+        *,
+        max_length: Optional[int] = None,
+        semantics: str = SEMANTICS_TOTAL,
+        slack: int = 0,
+    ) -> GenerateSummary:
+        """Convert every recorded outermost call into a :class:`CallRecord`.
+
+        ``stop_reason`` is ``"eos"`` when the final token is EOS; ``"length"``
+        only when the call's token count reached the effective limit given
+        ``max_length`` and ``semantics``; otherwise ``"other"``.
+        """
         calls: list[CallRecord] = []
         for rec in self.records:
             total, ended = _seq_total_and_eos(rec["out"], eos_token_id)
@@ -459,7 +491,12 @@ class GenerateCapture:
                 output_tokens = total - input_tokens
             else:
                 output_tokens = total
-            stop_reason = "eos" if ended is True else "length" if ended is False else "unknown"
+            if ended is True:
+                stop_reason = "eos"
+            elif _limit_reached(total, output_tokens, max_length, semantics, slack):
+                stop_reason = "length"
+            else:
+                stop_reason = "other"
             calls.append(CallRecord(rec.get("target"), input_tokens, output_tokens, stop_reason))
         return GenerateSummary(calls=calls, fired=bool(self.records))
 
@@ -619,6 +656,8 @@ def run_inference(
     output_dir: Path,
     infer_kwargs: dict[str, Any],
     capture_generate: bool = True,
+    max_length_semantics: str = SEMANTICS_TOTAL,
+    max_length_slack: int = 0,
 ) -> InferenceOutcome:
     """Run a single ``infer`` or ``infer_multi`` call and collect its output.
 
@@ -663,7 +702,12 @@ def run_inference(
 
     return_value, wall, gpu_seconds, peak_vram = _run_timed(guarded)
     summary = (
-        capture.summarize(getattr(tokenizer, "eos_token_id", None))
+        capture.summarize(
+            getattr(tokenizer, "eos_token_id", None),
+            max_length=infer_kwargs.get("max_length"),
+            semantics=max_length_semantics,
+            slack=max_length_slack,
+        )
         if capture is not None
         else GenerateSummary(calls=[], fired=False)
     )
