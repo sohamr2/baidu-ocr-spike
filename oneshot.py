@@ -24,14 +24,25 @@ def sh(cmd: str) -> int:
     return subprocess.run(cmd, shell=True).returncode
 
 
-# --- 1) Python deps (NO torch/torchvision pin -> no restart) ----------------
+# --- 1) Python deps (NO torch/torchvision/Pillow pin -> no restart) ---------
+# Do NOT pin Pillow: Colab's torchvision (which the model's remote code imports)
+# needs the Pillow it shipped with. Pillow 12 removed internals torchvision uses
+# ("cannot import name '_Int' from 'PIL._typing'"), so keep Pillow on the 11.x line.
 sh(
     f"{sys.executable} -m pip install -q "
     "transformers==4.57.1 huggingface-hub==0.35.3 safetensors==0.4.5 "
     "accelerate==1.1.1 einops==0.8.2 addict==2.4.0 easydict==1.13 "
-    "pymupdf==1.27.2.2 jiwer==3.0.4 rapidfuzz==3.10.1 pandas==2.2.3 "
-    "Pillow==12.1.1 matplotlib==3.10.8"
+    "pymupdf==1.27.2.2 jiwer==3.0.4 rapidfuzz==3.10.1 pandas==2.2.3"
 )
+# Keep/repair a torchvision-compatible Pillow (undo any earlier Pillow 12 install).
+sh(f"{sys.executable} -m pip install -q 'Pillow>=11,<12'")
+# Drop any half-imported PIL/torchvision so the corrected Pillow is picked up
+# WITHOUT needing a runtime restart.
+for _m in [
+    k for k in list(sys.modules)
+    if k == "PIL" or k.startswith("PIL.") or k == "torchvision" or k.startswith("torchvision.")
+]:
+    del sys.modules[_m]
 
 # --- 2) edlib: build from source (shipped cpp includes longintrepr.h) -------
 try:
