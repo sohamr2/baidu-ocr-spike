@@ -286,70 +286,132 @@ def estimate_input_tokens(
 # --------------------------------------------------------------------------- #
 @dataclass
 class GenerateSummary:
-    """Best-effort summary of captured ``model.generate`` calls."""
+    """Best-effort summary of captured ``generate`` calls.
+
+    ``input_tokens`` is the measured input length (text + expanded image tokens)
+    taken from the ids/embeds passed to ``generate`` on the call that fired.
+    ``fired`` is False when no patched ``generate`` was invoked, in which case
+    callers must fall back to the token-count estimate (and should warn).
+    """
 
     generate_calls: int
     last_total_tokens: Optional[int]
+    input_tokens: Optional[int]
     ended_with_eos: Optional[bool]
+    fired: bool
+    target: Optional[str]
+
+
+def _infer_input_len(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[int]:
+    """Measure the sequence length passed into ``generate``.
+
+    Handles both ``input_ids`` (``[batch, seq]``) and ``inputs_embeds``
+    (``[batch, seq, hidden]``) by reading the batch-first sequence dim, so the
+    count includes the model's expanded image tokens.
+    """
+    candidate = None
+    for key in ("input_ids", "inputs_embeds", "inputs", "input"):
+        value = kwargs.get(key)
+        if isinstance(value, torch.Tensor):
+            candidate = value
+            break
+    if candidate is None:
+        for value in args:
+            if isinstance(value, torch.Tensor):
+                candidate = value
+                break
+    if candidate is None:
+        return None
+    try:
+        return int(candidate.shape[1]) if candidate.ndim >= 2 else int(candidate.shape[0])
+    except (IndexError, RuntimeError):
+        return None
 
 
 class GenerateCapture:
-    """Transiently wrap ``model.generate`` to record its output.
+    """Transiently wrap ``generate`` on the model and every submodule that owns it.
 
-    The remote ``infer`` code usually calls ``self.generate(...)``. When it
-    does, we capture the returned ids so we can read the true total length and
-    whether generation ended on EOS (a natural stop) rather than the length cap.
-    If the remote code does not go through ``model.generate`` the capture simply
-    records nothing and callers fall back to token-count approximation.
+    The remote ``infer``/``infer_multi`` code may call ``self.generate(...)`` or
+    an inner module's ``generate`` (e.g. a language-model submodule). Rather than
+    silently falling back to approximation, we patch the model plus every
+    submodule exposing a callable ``generate`` and record which one fired, its
+    returned ids (true total length, EOS vs length stop), and the measured input
+    length. ``fired`` reports whether any wrapper was actually invoked.
     """
 
     def __init__(self, model: Any) -> None:
         self._model = model
-        self._original: Optional[Callable[..., Any]] = None
-        self.records: list[Any] = []
+        self._patched: list[tuple[Any, Callable[..., Any]]] = []
+        self.records: list[dict[str, Any]] = []
+
+    def _targets(self) -> list[tuple[str, Any]]:
+        targets: list[tuple[str, Any]] = [("<model>", self._model)]
+        for name, module in self._model.named_modules():
+            if module is self._model:
+                continue
+            if callable(getattr(module, "generate", None)):
+                targets.append((name, module))
+        return targets
 
     def __enter__(self) -> "GenerateCapture":
-        original = getattr(self._model, "generate", None)
-        if callable(original):
-            self._original = original
+        for name, module in self._targets():
+            original = getattr(module, "generate", None)
+            if not callable(original):
+                continue
 
-            def wrapper(*args: Any, **kwargs: Any) -> Any:
-                out = original(*args, **kwargs)
-                self.records.append(out)
-                return out
+            def make_wrapper(orig: Callable[..., Any], target: str) -> Callable[..., Any]:
+                def wrapper(*args: Any, **kwargs: Any) -> Any:
+                    out = orig(*args, **kwargs)
+                    self.records.append(
+                        {"target": target, "out": out,
+                         "input_len": _infer_input_len(args, kwargs)}
+                    )
+                    return out
+
+                return wrapper
 
             try:
-                self._model.generate = wrapper  # type: ignore[assignment]
+                module.generate = make_wrapper(original, name)  # type: ignore[assignment]
+                self._patched.append((module, original))
             except (AttributeError, TypeError):
-                self._original = None
+                pass
         return self
 
     def __exit__(self, *exc: object) -> None:
-        if self._original is not None:
+        for module, original in self._patched:
             try:
-                self._model.generate = self._original  # type: ignore[assignment]
+                module.generate = original  # type: ignore[assignment]
             except (AttributeError, TypeError):
                 pass
-            self._original = None
+        self._patched.clear()
 
     def summarize(self, eos_token_id: Optional[int]) -> GenerateSummary:
         """Summarize captured calls (uses the last call for totals/stop reason)."""
         if not self.records:
-            return GenerateSummary(0, None, None)
+            return GenerateSummary(0, None, None, None, False, None)
         last = self.records[-1]
-        seq = getattr(last, "sequences", None)
-        if seq is None and isinstance(last, torch.Tensor):
-            seq = last
-        if seq is None:
-            return GenerateSummary(len(self.records), None, None)
-        try:
-            row = seq[0] if seq.ndim >= 2 else seq
-            total = int(row.shape[-1])
-            last_token = int(row[-1])
-        except (IndexError, RuntimeError, ValueError):
-            return GenerateSummary(len(self.records), None, None)
-        ended = None if eos_token_id is None else (last_token == eos_token_id)
-        return GenerateSummary(len(self.records), total, ended)
+        out = last["out"]
+        seq = getattr(out, "sequences", None)
+        if seq is None and isinstance(out, torch.Tensor):
+            seq = out
+        total: Optional[int] = None
+        ended: Optional[bool] = None
+        if seq is not None:
+            try:
+                row = seq[0] if seq.ndim >= 2 else seq
+                total = int(row.shape[-1])
+                last_token = int(row[-1])
+                ended = None if eos_token_id is None else (last_token == eos_token_id)
+            except (IndexError, RuntimeError, ValueError):
+                total = None
+        return GenerateSummary(
+            generate_calls=len(self.records),
+            last_total_tokens=total,
+            input_tokens=last.get("input_len"),
+            ended_with_eos=ended,
+            fired=True,
+            target=last.get("target"),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -420,7 +482,10 @@ class InferenceOutcome:
     cleaned_path: str
     generate_calls: int = 0
     captured_total_tokens: Optional[int] = None
+    captured_input_tokens: Optional[int] = None
     captured_ended_eos: Optional[bool] = None
+    capture_fired: bool = False
+    capture_target: Optional[str] = None
 
 
 def _run_timed(call: Callable[[], Any]) -> tuple[Any, float, float, float]:
@@ -501,8 +566,13 @@ def run_inference(
     summary = (
         capture.summarize(getattr(tokenizer, "eos_token_id", None))
         if capture is not None
-        else GenerateSummary(0, None, None)
+        else GenerateSummary(0, None, None, None, False, None)
     )
+    if capture is not None and not summary.fired:
+        logger.warning(
+            "GenerateCapture did not fire (no patched generate was called); "
+            "input tokens and stop reason are approximate for this run."
+        )
 
     raw_text, output_files = collect_output(return_value, output_dir)
     parsed = metrics.parse_markers(raw_text)
@@ -526,7 +596,10 @@ def run_inference(
         cleaned_path=str(cleaned_path),
         generate_calls=summary.generate_calls,
         captured_total_tokens=summary.last_total_tokens,
+        captured_input_tokens=summary.input_tokens,
         captured_ended_eos=summary.ended_with_eos,
+        capture_fired=summary.fired,
+        capture_target=summary.target,
     )
 
 
@@ -644,6 +717,23 @@ def _compute_hit_max_length(
     return (input_tokens + output_tokens) >= threshold
 
 
+def _measured_image_tokens(
+    *,
+    captured_input_tokens: Optional[int],
+    prompt_tokens: Optional[int],
+    n_pages: Optional[int],
+) -> Optional[float]:
+    """Measured image tokens per page = (actual input - prompt text) / pages.
+
+    Lets us compare the real per-page image-token cost against the configured
+    ``IMAGE_TOKENS_PER_PAGE`` estimate. Returns None when the capture or inputs
+    needed to compute it are missing.
+    """
+    if captured_input_tokens is None or prompt_tokens is None or not n_pages:
+        return None
+    return round((captured_input_tokens - prompt_tokens) / n_pages, 1)
+
+
 def _stop_reason(hit_max_length: bool, captured_ended_eos: Optional[bool]) -> str:
     """Return the stop reason, preferring the captured EOS signal when present."""
     if captured_ended_eos is not None:
@@ -663,6 +753,7 @@ def execute_run(
     max_length_slack: int,
     max_length_semantics: str,
     input_tokens: Optional[int] = None,
+    prompt_tokens: Optional[int] = None,
     evaluator: Optional[Callable[[InferenceOutcome], dict[str, Any]]] = None,
     last_page_check: Optional[Callable[[InferenceOutcome], bool]] = None,
     force: bool = False,
@@ -696,7 +787,11 @@ def execute_run(
         "revision": revision,
         "max_length": max_length,
         "max_length_semantics": max_length_semantics,
-        "input_tokens": input_tokens,
+        "input_tokens": input_tokens,  # estimate from IMAGE_TOKENS_PER_PAGE
+        "input_tokens_actual": None,  # measured from GenerateCapture
+        "image_tokens_per_page_measured": None,
+        "capture_fired": None,
+        "capture_target": None,
         "wall_seconds": None,
         "gpu_seconds": None,
         "peak_vram_gb": None,
@@ -723,6 +818,11 @@ def execute_run(
             slack=max_length_slack,
         )
         covered = last_page_check(outcome) if last_page_check is not None else None
+        measured_img = _measured_image_tokens(
+            captured_input_tokens=outcome.captured_input_tokens,
+            prompt_tokens=prompt_tokens,
+            n_pages=run_key.get("input_pages"),
+        )
         row.update(
             wall_seconds=round(outcome.wall_seconds, 3),
             gpu_seconds=round(outcome.gpu_seconds, 3),
@@ -730,6 +830,10 @@ def execute_run(
             output_tokens=outcome.output_tokens,
             generate_calls=outcome.generate_calls,
             captured_total_tokens=outcome.captured_total_tokens,
+            input_tokens_actual=outcome.captured_input_tokens,
+            image_tokens_per_page_measured=measured_img,
+            capture_fired=outcome.capture_fired,
+            capture_target=outcome.capture_target,
             hit_max_length=bool(hit_max),
             stop_reason=_stop_reason(hit_max, outcome.captured_ended_eos),
             last_page_covered=covered,
@@ -737,6 +841,12 @@ def execute_run(
             raw_path=outcome.raw_path,
             cleaned_path=outcome.cleaned_path,
         )
+        if not outcome.capture_fired:
+            logger.warning(
+                "Run %s: GenerateCapture did not fire; input_tokens_actual is "
+                "unavailable and hit_max_length/stop_reason are approximate.",
+                run_key,
+            )
         if evaluator is not None:
             try:
                 row.update(evaluator(outcome))

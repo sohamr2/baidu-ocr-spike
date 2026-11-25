@@ -124,6 +124,39 @@ print("=" * 72)
 
 # --------------------------------------------------------------------------- #
 md(r"""
+## 0b. Run the unit tests first
+
+Runs `pytest tests -q` and **raises if anything fails or is skipped**. On Colab `edlib` installs
+as a wheel, so the alignment tests must actually run (0 skipped) before any experiment.
+""")
+
+code(r"""
+# ===== Gate: unit tests must pass with 0 skipped before any experiment =====
+import re
+import subprocess
+import sys
+
+result = subprocess.run(
+    [sys.executable, "-m", "pytest", "tests", "-q"], capture_output=True, text=True
+)
+print(result.stdout[-4000:])
+if result.stderr.strip():
+    print("STDERR:\n", result.stderr[-2000:])
+
+if result.returncode != 0:
+    raise RuntimeError("Unit tests failed -- fix before running any experiment.")
+
+skipped = re.search(r"(\d+) skipped", result.stdout)
+if skipped and int(skipped.group(1)) > 0:
+    raise RuntimeError(
+        f"{skipped.group(1)} test(s) skipped -- edlib must be installed so the alignment "
+        "tests run on Colab before experiments. Check the install cell."
+    )
+print("All unit tests passed (0 skipped).")
+""")
+
+# --------------------------------------------------------------------------- #
+md(r"""
 ## 1. Config — every tunable lives here
 
 Set your 3 books in `BOOKS` (schema shown). Also set `GPU_PRICE_PER_HOUR` to your real hourly
@@ -174,6 +207,8 @@ MULTI_KWARGS = dict(
 # "max_length"     => cap counts prompt + image + output tokens
 # "max_new_tokens" => cap counts output tokens only
 MAX_LENGTH_SEMANTICS = "max_length"
+# Guard: experiments refuse to run until you confirm the section-3 findings and set this True.
+MAX_LENGTH_SEMANTICS_CONFIRMED = False
 MAX_LENGTH_SLACK = 64            # within this many tokens of the cap still counts as "hit"
 IMAGE_TOKENS_PER_PAGE = 256      # read from modeling code; used for the input-token estimate
 BASE_MAX_LENGTH = 32768
@@ -298,15 +333,20 @@ Read the lines above and decide:
   image + output** tokens. Set `MAX_LENGTH_SEMANTICS = "max_length"` (default).
 - If it calls `self.generate(..., max_new_tokens=max_length)` → the cap counts **output only**.
   Set `MAX_LENGTH_SEMANTICS = "max_new_tokens"`.
-- Note the image-token count per page / tile and set `IMAGE_TOKENS_PER_PAGE` accordingly.
+- Set `IMAGE_TOKENS_PER_PAGE` to a rough per-page estimate; the spike then **measures** the real
+  value and logs it, so you can correct the estimate.
+- **Confirm, then set `MAX_LENGTH_SEMANTICS_CONFIRMED = True`** in the config — the experiment
+  cells refuse to run until you do.
 
 How this spike uses it:
 
-- `hit_max_length` is computed from the chosen semantics. When the remote code routes through
-  `model.generate`, `GenerateCapture` records the **true** total token count and whether
-  generation ended on EOS (a natural stop) vs the length cap — that true signal wins over the
-  token-count approximation. `generate_calls`, `captured_total_tokens` and `stop_reason` are
-  logged in every row.
+- `hit_max_length` is computed from the chosen semantics. `GenerateCapture` patches `generate` on
+  the model **and every submodule that owns it** (so an inner language-model `generate` is still
+  caught) and records the **true** total token count, the **measured input length** (text +
+  expanded image tokens), and whether generation ended on EOS vs the length cap. Each row logs
+  `capture_fired`, `capture_target`, `input_tokens_actual`, `image_tokens_per_page_measured`
+  (next to the `input_tokens` estimate), `generate_calls`, `captured_total_tokens` and
+  `stop_reason`. If the capture does not fire, a warning is emitted — the fallback is never silent.
 - A 300-page book is ~150k+ output tokens, far beyond 32,768 — so at the default cap, "whole book
   in one pass" is expected to truncate. Experiment B measures this directly and then raises the
   cap (`MAX_LENGTH_ESCALATION`) until it stops truncating or OOMs.
@@ -355,6 +395,12 @@ against its matching GT span (infix alignment).
 """)
 
 code(r"""
+if not MAX_LENGTH_SEMANTICS_CONFIRMED:
+    raise RuntimeError(
+        "Set MAX_LENGTH_SEMANTICS_CONFIRMED = True in the config cell after "
+        "confirming the section-3 max_length findings."
+    )
+
 if books:
     pid = BOOKS[A_BOOK_INDEX]["id"]
     bk = books[pid]
@@ -379,6 +425,7 @@ if books:
                                             infer_kwargs=kwargs)),
                 max_length=kwargs["max_length"], max_length_slack=MAX_LENGTH_SLACK,
                 max_length_semantics=MAX_LENGTH_SEMANTICS, input_tokens=in_tokens,
+                prompt_tokens=infer.count_tokens(tokenizer, PROMPT_SINGLE),
                 evaluator=make_evaluator(bk["ground_truth"], slice_to_span=True),
                 force=FORCE,
             )
@@ -399,6 +446,13 @@ increasing after the first OOM, or when output is still truncated at the highest
 """)
 
 code(r"""
+if not MAX_LENGTH_SEMANTICS_CONFIRMED:
+    raise RuntimeError(
+        "Set MAX_LENGTH_SEMANTICS_CONFIRMED = True in the config cell after "
+        "confirming the section-3 max_length findings."
+    )
+
+
 def run_multi_n(pid, n, max_length):
     bk = books[pid]
     images = bk["images"][:n]
@@ -426,6 +480,7 @@ def run_multi_n(pid, n, max_length):
                                             infer_kwargs=kwargs)),
         max_length=max_length, max_length_slack=MAX_LENGTH_SLACK,
         max_length_semantics=MAX_LENGTH_SEMANTICS, input_tokens=in_tokens,
+        prompt_tokens=infer.count_tokens(tokenizer, PROMPT_MULTI),
         evaluator=make_evaluator(bk["ground_truth"], slice_to_span=(n < bk["n_pages"])),
         last_page_check=last_page_check, force=FORCE,
     )
@@ -475,6 +530,13 @@ GPU / VRAM across the chunks.
 """)
 
 code(r"""
+if not MAX_LENGTH_SEMANTICS_CONFIRMED:
+    raise RuntimeError(
+        "Set MAX_LENGTH_SEMANTICS_CONFIRMED = True in the config cell after "
+        "confirming the section-3 max_length findings."
+    )
+
+
 def run_chunked(pid, k, overlap):
     bk = books[pid]
     n_pages = bk["n_pages"]
@@ -503,6 +565,7 @@ def run_chunked(pid, k, overlap):
                                         infer_kwargs=kwargs)),
             max_length=kwargs["max_length"], max_length_slack=MAX_LENGTH_SLACK,
             max_length_semantics=MAX_LENGTH_SEMANTICS, input_tokens=in_tokens,
+            prompt_tokens=infer.count_tokens(tokenizer, PROMPT_MULTI),
             evaluator=make_evaluator(bk["ground_truth"], slice_to_span=True), force=FORCE,
         )
         if row.get("error"):

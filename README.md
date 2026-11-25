@@ -42,9 +42,13 @@ baidu-ocr-spike/
      CUDA 12.9 torch wheels (falling back to a matching `cu12x` wheel if needed), installs the
      pinned deps, and prints **RESTART REQUIRED** if Colab shipped a different torch. If so,
      `Runtime > Restart session` and re-run from the **next** cell (skip cell 0).
+   - **Cell 0b (test gate)** runs `pytest tests -q` and raises if anything fails **or is
+     skipped** — on Colab `edlib` is installed, so the alignment tests must actually run before
+     any experiment.
    - **Config cell**: set `BOOKS` (your 3 books), `GPU_PRICE_PER_HOUR`, and thresholds.
    - The rest mount Drive, probe the GPU, load the model at a pinned commit, prep data, and run
-     the experiments.
+     the experiments. After reading the section-3 `max_length` findings you must set
+     `MAX_LENGTH_SEMANTICS_CONFIRMED = True`; Experiments A/B/C refuse to run until you do.
 4. Everything (inputs, cached page images, raw/cleaned outputs, `results.jsonl`, report charts)
    is written under `MyDrive/ocr_spike/`, so a disconnect does not lose work. Re-running skips
    runs whose results already exist unless you set `FORCE = True`.
@@ -85,9 +89,13 @@ The model card passes `max_length=32768`. A 300-page book is ~150k+ output token
 single-pass is expected to truncate. Section 3 of the notebook reads the remote modeling code to
 determine whether `max_length` reaches `generate()` as **`max_length`** (prompt + image + output)
 or **`max_new_tokens`** (output only); set `MAX_LENGTH_SEMANTICS` accordingly. Each run records
-input tokens, output tokens, `hit_max_length`, and a `stop_reason`. When the remote code routes
-through `model.generate`, the true total token count and EOS-vs-length stop reason are captured
-directly rather than approximated.
+input tokens, output tokens, `hit_max_length`, and a `stop_reason`. The true total token count,
+EOS-vs-length stop reason, and the **measured** input length are captured directly: `GenerateCapture`
+patches `generate` on the model *and every submodule that owns it*, so an inner language-model
+`generate` is still caught. Each row logs `capture_fired`, `input_tokens_actual`, and
+`image_tokens_per_page_measured` next to the `IMAGE_TOKENS_PER_PAGE` estimate — so image-token cost
+is measured, not assumed. If the capture does not fire, a warning is emitted (never a silent
+fallback).
 
 ## Metrics
 
